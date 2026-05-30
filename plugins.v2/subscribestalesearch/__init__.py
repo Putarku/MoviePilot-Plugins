@@ -27,7 +27,7 @@ class SubscribeStaleSearch(_PluginBase):
     plugin_icon = "SubscribeStale.png"
     plugin_version = "1.1"
     plugin_author = "布丁"
-    author_url = "https://github.com"
+    author_url = "https://github.com/Putarku"
     plugin_config_prefix = "subscribestalesearch_"
     plugin_order = 29
     auth_level = 1

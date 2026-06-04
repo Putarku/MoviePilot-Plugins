@@ -15,6 +15,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType, NotificationType
 
 lock = Lock()
+_pending_lock = Lock()
 
 
 class SubscribeStaleSearch(_PluginBase):
@@ -23,9 +24,10 @@ class SubscribeStaleSearch(_PluginBase):
     """
 
     plugin_name = "订阅超期搜索"
-    plugin_desc = "定时筛选超过指定天数未更新的订阅，并主动触发一次搜索后汇总通知。"
+    plugin_desc = "定时筛选超过指定天数未更新的订阅，并主动触发一次搜索后汇总通知。" \
+                  "支持连续搜索无结果自动待定、待定订阅定期检查重新激活。"
     plugin_icon = "SubscribeStale.png"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "布丁"
     author_url = "https://github.com/Putarku"
     plugin_config_prefix = "subscribestalesearch_"
@@ -47,6 +49,15 @@ class SubscribeStaleSearch(_PluginBase):
     _stat_search_mode: str = "id"
     _max_count: int = 0
 
+    # 连续失败自动待定
+    _auto_pending: bool = True
+    _consecutive_limit: int = 3
+
+    # 待定订阅定期检查
+    _pending_check_enabled: bool = False
+    _pending_check_cron: str = "0 4 * * 0"
+    _pending_check_notify: bool = True
+
     def init_plugin(self, config: dict = None):
         """
         初始化插件配置，并处理立即执行任务。
@@ -66,6 +77,16 @@ class SubscribeStaleSearch(_PluginBase):
             self._stat_enabled = config.get("stat_enabled", True)
             self._stat_search_mode = config.get("stat_search_mode") or "id"
             self._max_count = max(self._safe_int(config.get("max_count"), 0), 0)
+            # 连续失败自动待定
+            self._auto_pending = config.get("auto_pending", True)
+            self._consecutive_limit = max(self._safe_int(config.get("consecutive_limit"), 3), 1)
+            # 待定订阅定期检查
+            self._pending_check_enabled = config.get("pending_check_enabled", False)
+            self._pending_check_cron = config.get("pending_check_cron") or "0 4 * * 0"
+            self._pending_check_notify = config.get("pending_check_notify", True)
+
+        # 清理失效的连续失败计数
+        self._cleanup_consecutive_fails()
 
         if self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -97,15 +118,24 @@ class SubscribeStaleSearch(_PluginBase):
         """
         注册插件定时服务。
         """
-        if not self._enabled or not self._cron:
-            return []
-        return [{
-            "id": "SubscribeStaleSearch",
-            "name": "订阅超期搜索",
-            "trigger": CronTrigger.from_crontab(self._cron),
-            "func": self.run,
-            "kwargs": {},
-        }]
+        services = []
+        if self._enabled and self._cron:
+            services.append({
+                "id": "SubscribeStaleSearch",
+                "name": "订阅超期搜索",
+                "trigger": CronTrigger.from_crontab(self._cron),
+                "func": self.run,
+                "kwargs": {},
+            })
+        if self._enabled and self._pending_check_enabled and self._pending_check_cron:
+            services.append({
+                "id": "SubscribeStaleSearchPendingCheck",
+                "name": "待定订阅检查",
+                "trigger": CronTrigger.from_crontab(self._pending_check_cron),
+                "func": self.run_pending_check,
+                "kwargs": {},
+            })
+        return services
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
@@ -335,6 +365,127 @@ class SubscribeStaleSearch(_PluginBase):
                             }
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "auto_pending",
+                                            "label": "连续无结果自动待定",
+                                            "hint": "启用后，订阅连续多次搜索均无进展时将自动置为待定状态",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "consecutive_limit",
+                                            "label": "连续失败次数",
+                                            "type": "number",
+                                            "hint": "连续多少次搜索无进展后自动待定（默认3次）",
+                                            "placeholder": "3",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "连续无结果自动待定：每次超期搜索时会记录订阅的搜索进展，连续多次搜索均无进展（无新增下载记录、缺失集数未减少）时将订阅自动置为待定状态，避免无效搜索。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "pending_check_enabled",
+                                            "label": "启用待定订阅检查",
+                                            "hint": "定期检查待定状态的订阅，重新搜索看是否有可用资源",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VCronField",
+                                        "props": {
+                                            "model": "pending_check_cron",
+                                            "label": "检查周期",
+                                            "placeholder": "5位cron表达式",
+                                            "hint": "默认每周日凌晨4点执行",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "pending_check_notify",
+                                            "label": "激活时发送通知",
+                                            "hint": "有待定订阅被重新激活时发送通知",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "待定订阅检查：按设定周期对待定(P)状态的订阅重新触发搜索，如果搜索到可用资源则自动恢复为订阅中(R)状态，让已下线的资源在重新出现时能被自动抓取。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
                 ],
             }
         ], {
@@ -350,53 +501,203 @@ class SubscribeStaleSearch(_PluginBase):
             "stat_enabled": True,
             "stat_search_mode": "id",
             "max_count": 0,
+            "auto_pending": True,
+            "consecutive_limit": 3,
+            "pending_check_enabled": False,
+            "pending_check_cron": "0 4 * * 0",
+            "pending_check_notify": True,
         }
 
     def get_page(self) -> List[dict]:
         """
-        获取插件详情页面。
+        获取插件详情页面（含执行记录、待定订阅、连续失败追踪）。
         """
+        sections = []
+
+        # -------- 1. 超期搜索执行记录 --------
         history = self.get_data("history") or []
-        if not history:
-            return [
-                {
-                    "component": "div",
-                    "text": "暂无执行记录",
-                    "props": {"class": "text-center mt-4"},
-                }
-            ]
-
-        rows = []
-        for item in reversed(history[-20:]):
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {"component": "td", "text": item.get("time")},
-                    {"component": "td", "text": item.get("summary")},
-                    {"component": "td", "text": item.get("details") or item.get("titles")},
-                ],
+        if history:
+            rows = []
+            for item in reversed(history[-20:]):
+                rows.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "text": item.get("time")},
+                        {"component": "td", "text": item.get("summary")},
+                        {"component": "td", "text": item.get("details") or item.get("titles")},
+                    ],
+                })
+            sections.append({
+                "component": "div",
+                "props": {"class": "text-h6 mb-2 mt-4"},
+                "text": "超期搜索执行记录",
             })
-
-        return [
-            {
+            sections.append({
                 "component": "VTable",
-                "props": {"hover": True},
+                "props": {"hover": True, "density": "compact"},
                 "content": [
                     {
                         "component": "thead",
-                        "content": [
-                            {
-                                "component": "tr",
-                                "content": [
-                                    {"component": "th", "text": "执行时间"},
-                                    {"component": "th", "text": "执行摘要"},
-                                    {"component": "th", "text": "执行明细"},
-                                ],
-                            }
-                        ],
+                        "content": [{
+                            "component": "tr",
+                            "content": [
+                                {"component": "th", "text": "执行时间"},
+                                {"component": "th", "text": "执行摘要"},
+                                {"component": "th", "text": "执行明细"},
+                            ],
+                        }],
                     },
                     {"component": "tbody", "content": rows},
                 ],
+            })
+        else:
+            sections.append({
+                "component": "div",
+                "props": {"class": "text-center mt-4"},
+                "text": "暂无超期搜索执行记录",
+            })
+
+        # -------- 2. 待定订阅列表 --------
+        try:
+            pending_subs = SubscribeOper().list(state="P")
+            if pending_subs:
+                p_rows = []
+                for sub in pending_subs:
+                    title = self._format_subscribe_title(sub)
+                    lack = sub.lack_episode or "-"
+                    since = sub.last_update or sub.date or "-"
+                    p_rows.append({
+                        "component": "tr",
+                        "content": [
+                            {"component": "td", "text": title},
+                            {"component": "td", "text": sub.type or "-"},
+                            {"component": "td", "text": str(lack)},
+                            {"component": "td", "text": since},
+                        ],
+                    })
+                sections.append({
+                    "component": "div",
+                    "props": {"class": "text-h6 mb-2 mt-4"},
+                    "text": f"待定订阅 (共 {len(pending_subs)} 个)",
+                })
+                sections.append({
+                    "component": "VTable",
+                    "props": {"hover": True, "density": "compact"},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [{
+                                "component": "tr",
+                                "content": [
+                                    {"component": "th", "text": "名称"},
+                                    {"component": "th", "text": "类型"},
+                                    {"component": "th", "text": "缺失"},
+                                    {"component": "th", "text": "最后更新"},
+                                ],
+                            }],
+                        },
+                        {"component": "tbody", "content": p_rows},
+                    ],
+                })
+        except Exception as err:
+            logger.error(f"获取待定订阅列表失败：{err}")
+
+        # -------- 3. 连续失败追踪 --------
+        consec_data = self.get_data("consecutive_fails") or {}
+        if consec_data:
+            c_rows = []
+            # 获取订阅名称
+            for sid_str, count in sorted(consec_data.items(), key=lambda x: x[1], reverse=True):
+                try:
+                    sub = SubscribeOper().get(int(sid_str))
+                    if not sub:
+                        continue
+                    title = self._format_subscribe_title(sub)
+                except (ValueError, TypeError):
+                    title = f"ID:{sid_str}"
+                limit = self._consecutive_limit
+                bar = "■" * min(count, limit) + "□" * max(limit - count, 0)
+                c_rows.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "text": title},
+                        {"component": "td", "text": f"{count}/{limit}"},
+                        {"component": "td", "text": bar},
+                    ],
+                })
+            if c_rows:
+                sections.append({
+                    "component": "div",
+                    "props": {"class": "text-h6 mb-2 mt-4"},
+                    "text": "连续失败追踪 (即将自动待定的订阅)",
+                })
+                sections.append({
+                    "component": "VTable",
+                    "props": {"hover": True, "density": "compact"},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [{
+                                "component": "tr",
+                                "content": [
+                                    {"component": "th", "text": "名称"},
+                                    {"component": "th", "text": "连续失败"},
+                                    {"component": "th", "text": "进度"},
+                                ],
+                            }],
+                        },
+                        {"component": "tbody", "content": c_rows},
+                    ],
+                })
+
+        # -------- 4. 待定订阅检查记录 --------
+        pend_history = self.get_data("pending_check_history") or []
+        if pend_history:
+            ph_rows = []
+            for item in reversed(pend_history[-20:]):
+                detail_parts = item.get("detail_parts", {})
+                reactivated = detail_parts.get("reactivated", [])
+                detail_text = (
+                    f"已激活 {len(reactivated)} 个"
+                    if reactivated else "无变化"
+                )
+                ph_rows.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "text": item.get("time")},
+                        {"component": "td", "text": item.get("summary")},
+                        {"component": "td", "text": detail_text},
+                    ],
+                })
+            sections.append({
+                "component": "div",
+                "props": {"class": "text-h6 mb-2 mt-4"},
+                "text": "待定订阅检查记录",
+            })
+            sections.append({
+                "component": "VTable",
+                "props": {"hover": True, "density": "compact"},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [{
+                            "component": "tr",
+                            "content": [
+                                {"component": "th", "text": "执行时间"},
+                                {"component": "th", "text": "执行摘要"},
+                                {"component": "th", "text": "激活详情"},
+                            ],
+                        }],
+                    },
+                    {"component": "tbody", "content": ph_rows},
+                ],
+            })
+
+        return sections if sections else [
+            {
+                "component": "div",
+                "text": "暂无数据",
+                "props": {"class": "text-center mt-4"},
             }
         ]
 
@@ -414,6 +715,33 @@ class SubscribeStaleSearch(_PluginBase):
             finally:
                 self._scheduler = None
 
+    def _cleanup_consecutive_fails(self):
+        """
+        清除已失效的连续失败计数（订阅已删除、已完成等）。
+        """
+        consec_data = self.get_data("consecutive_fails") or {}
+        if not consec_data:
+            return
+
+        stale_ids = []
+        for sid_str in consec_data:
+            try:
+                sub = SubscribeOper().get(int(sid_str))
+                if sub is None:
+                    # 订阅已被删除
+                    stale_ids.append(sid_str)
+                elif sub.state not in ["N", "R", "P"]:
+                    # 已完成或暂停的订阅不再需要追踪
+                    stale_ids.append(sid_str)
+            except (ValueError, TypeError):
+                stale_ids.append(sid_str)
+
+        if stale_ids:
+            for sid in stale_ids:
+                consec_data.pop(sid, None)
+            self.save_data("consecutive_fails", consec_data)
+            logger.info(f"清理了 {len(stale_ids)} 个失效的连续失败计数")
+
     def run(self):
         """
         执行超期订阅扫描与搜索。
@@ -424,6 +752,9 @@ class SubscribeStaleSearch(_PluginBase):
         if not lock.acquire(blocking=False):
             logger.warning("订阅超期搜索任务正在执行中，跳过本次运行")
             return
+
+        # 每次运行前清理失效的连续失败计数
+        self._cleanup_consecutive_fails()
 
         try:
             now = datetime.datetime.now()
@@ -445,12 +776,18 @@ class SubscribeStaleSearch(_PluginBase):
                     search_stat = self._preview_search_safe(subscribe) if self._stat_enabled else {}
                     SubscribeChain().search(sid=subscribe.id, manual=False)
                     after_subscribe = SubscribeOper().get(subscribe.id)
-                    result_stats.append(self._build_result_stat(
+                    result_stat = self._build_result_stat(
                         subscribe=after_subscribe or subscribe,
                         before_snapshot=before_snapshot,
                         search_stat=search_stat,
-                    ))
+                    )
+                    result_stats.append(result_stat)
                     success_count += 1
+
+                    # 连续失败自动待定追踪
+                    if self._auto_pending and self._consecutive_limit > 0:
+                        self._track_consecutive(subscribe, result_stat)
+
                 except Exception as err:
                     title = self._format_subscribe_title(subscribe)
                     logger.error(f"触发订阅搜索失败：{title}，原因：{err}")
@@ -462,6 +799,15 @@ class SubscribeStaleSearch(_PluginBase):
                         "resources": 0,
                         "sites": 0,
                     })
+                    # 异常也计为无进展
+                    if self._auto_pending and self._consecutive_limit > 0:
+                        self._track_consecutive(subscribe, {
+                            "title": title,
+                            "status": "失败",
+                            "message": str(err),
+                            "resources": 0,
+                            "sites": 0,
+                        })
 
             summary = f"命中 {total} 个订阅，成功触发 {success_count} 个，失败 {len(failed_items)} 个"
             logger.info(f"订阅超期搜索完成，{summary}")
@@ -475,6 +821,139 @@ class SubscribeStaleSearch(_PluginBase):
                 )
         finally:
             lock.release()
+
+    def _track_consecutive(self, subscribe: Any, result_stat: Dict[str, Any]):
+        """
+        跟踪订阅的连续无进展次数，达到阈值时自动置为待定。
+        """
+        progressed = result_stat.get("status") == "有进展"
+        sid = str(subscribe.id)
+
+        consec_data = self.get_data("consecutive_fails") or {}
+
+        if progressed:
+            # 搜索有进展，重置计数
+            if sid in consec_data:
+                logger.info(
+                    f"订阅 {self._format_subscribe_title(subscribe)} 搜索有进展，"
+                    f"重置连续无进展计数"
+                )
+                consec_data.pop(sid)
+        else:
+            # 搜索无进展（无结果或失败），增加计数
+            count = consec_data.get(sid, 0) + 1
+            consec_data[sid] = count
+            logger.info(
+                f"订阅 {self._format_subscribe_title(subscribe)} "
+                f"连续 {count} 次搜索未找到可用资源"
+            )
+
+            if count >= self._consecutive_limit and subscribe.state == "R":
+                # 将订阅置为待定状态
+                SubscribeOper().update(subscribe.id, {"state": "P"})
+                logger.info(
+                    f"订阅 {self._format_subscribe_title(subscribe)} "
+                    f"已达连续 {count} 次无可用资源，已自动置为待定状态"
+                )
+                # 置为待定后移除计数
+                consec_data.pop(sid, None)
+
+                if self._notify:
+                    self.post_message(
+                        mtype=NotificationType.Plugin,
+                        title="订阅已自动暂停",
+                        text=(
+                            f"订阅 {self._format_subscribe_title(subscribe)} "
+                            f"已连续 {count} 次搜索未找到可用资源，"
+                            f"已自动设置为待定(P)状态，将停止对该订阅的定期搜索。"
+                        ),
+                    )
+
+        self.save_data("consecutive_fails", consec_data)
+
+    def run_pending_check(self):
+        """
+        检查待定(P)状态的订阅，重新触发搜索以捕捉重新出现的资源。
+        如果搜索触发下载，订阅状态会自动变回订阅中(R)。
+        """
+        if not self._enabled:
+            return
+
+        if not _pending_lock.acquire(blocking=False):
+            logger.warning("待定订阅检查任务正在执行中，跳过本次运行")
+            return
+
+        try:
+            pending_subs = SubscribeOper().list(state="P")
+            if not pending_subs:
+                logger.info("待定订阅检查：暂无待定状态的订阅")
+                return
+
+            logger.info(f"待定订阅检查开始，共 {len(pending_subs)} 个待定订阅")
+
+            reactivated: List[str] = []
+            still_pending: List[str] = []
+            failed: List[str] = []
+
+            for subscribe in pending_subs:
+                try:
+                    title = self._format_subscribe_title(subscribe)
+                    logger.info(f"重新搜索待定订阅：{title}")
+                    before_state = subscribe.state
+                    SubscribeChain().search(sid=subscribe.id, manual=False)
+                    after_subscribe = SubscribeOper().get(subscribe.id)
+
+                    if after_subscribe and after_subscribe.state != before_state:
+                        reactivated.append(title)
+                        logger.info(
+                            f"待定订阅 {title} 已搜索到资源，"
+                            f"状态从 {before_state} 变更为 {after_subscribe.state}"
+                        )
+                    else:
+                        still_pending.append(title)
+                except Exception as err:
+                    title = self._format_subscribe_title(subscribe)
+                    logger.error(f"待定订阅 {title} 重新搜索失败：{err}")
+                    failed.append(title)
+
+            summary = (
+                f"检查待定订阅 {len(pending_subs)} 个，"
+                f"已激活 {len(reactivated)} 个，"
+                f"仍待定 {len(still_pending)} 个"
+            )
+            if failed:
+                summary += f"，失败 {len(failed)} 个"
+            logger.info(f"待定订阅检查完成，{summary}")
+
+            # 保存执行记录
+            history = self.get_data("pending_check_history") or []
+            history.append({
+                "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "summary": summary,
+                "detail_parts": {
+                    "reactivated": reactivated[:10],
+                    "still_pending": still_pending[:10],
+                    "failed": failed[:10],
+                },
+            })
+            self.save_data("pending_check_history", history[-30:])
+
+            # 发送通知
+            if self._pending_check_notify and reactivated:
+                notify_text = summary
+                if reactivated:
+                    notify_text += "\n\n已重新激活：\n" + "\n".join(
+                        f"- {t}" for t in reactivated[:10]
+                    )
+                    if len(reactivated) > 10:
+                        notify_text += f"\n...及其他 {len(reactivated) - 10} 个"
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title="待定订阅检查完成",
+                    text=notify_text,
+                )
+        finally:
+            _pending_lock.release()
 
     def _list_target_subscribes(self, now: datetime.datetime) -> List[Any]:
         """
@@ -504,27 +983,55 @@ class SubscribeStaleSearch(_PluginBase):
     def _build_notify_text(self, summary: str, titles: List[str], failed_items: List[str],
                            result_stats: List[Dict[str, Any]]) -> str:
         """
-        构建汇总通知内容。
+        构建汇总通知内容（分组归类、去除零值噪音）。
         """
-        lines = [
-            f"筛选状态：{','.join(self._states) if self._states else '全部'}",
-            f"媒体类型：{'、'.join(self._media_types) if self._media_types else '全部'}",
-            f"超期判定：{self._stale_mode_label()}",
-            f"超期天数：{self._days} 天",
-            summary,
+        config_line = (
+            f"筛选: {','.join(self._states) if self._states else '全部'} | "
+            f"{'、'.join(self._media_types) if self._media_types else '全部'} | "
+            f"超期 {self._days}天({self._stale_mode_label()})"
+        )
+
+        parts = ["═══ 订阅超期搜索报告 ═══", "", config_line, summary, ""]
+
+        # 按是否有进展和有资源分组
+        progressed = [s for s in result_stats if s.get("status") == "有进展"]
+        no_progress_with_res = [
+            s for s in result_stats
+            if s.get("status") != "有进展" and s.get("resources", 0) > 0
         ]
-        if result_stats:
-            preview = "\n".join(self._format_result_stat(item) for item in result_stats[:20])
-            lines.append(f"执行明细：\n{preview}")
-            if len(result_stats) > 20:
-                lines.append(f"其余 {len(result_stats) - 20} 个订阅未展开显示")
-        else:
-            lines.append("本次没有命中需要补搜的订阅")
+        no_progress_no_res = [
+            s for s in result_stats
+            if s.get("status") != "有进展" and s.get("resources", 0) == 0
+        ]
+
+        if progressed:
+            parts.append(f"✓ 有进展 ({len(progressed)})")
+            for item in progressed[:20]:
+                parts.append(f"  {self._format_result_stat(item)}")
+            parts.append("")
+
+        if no_progress_with_res:
+            parts.append(f"~ 有资源但无进展 ({len(no_progress_with_res)})")
+            for item in no_progress_with_res[:20]:
+                parts.append(f"  {self._format_result_stat(item)}")
+            parts.append("")
+
+        if no_progress_no_res:
+            parts.append(f"× 无可用资源 ({len(no_progress_no_res)})")
+            for item in no_progress_no_res[:20]:
+                parts.append(f"  {self._format_result_stat(item)}")
+            parts.append("")
+
+        if len(result_stats) > 20:
+            parts.append(f"...及其他 {len(result_stats) - 20} 个订阅")
 
         if failed_items:
-            failed_preview = "\n".join(f"- {title}" for title in failed_items[:20])
-            lines.append(f"触发失败：\n{failed_preview}")
-        return "\n".join(lines)
+            parts.append(f"! 执行失败 ({len(failed_items)})")
+            for title in failed_items[:20]:
+                parts.append(f"  {title}")
+            parts.append("")
+
+        return "\n".join(parts).rstrip()
 
     def _save_history(self, summary: str, titles: List[str], result_stats: List[Dict[str, Any]]):
         """
@@ -611,16 +1118,41 @@ class SubscribeStaleSearch(_PluginBase):
     @staticmethod
     def _format_result_stat(item: Dict[str, Any]) -> str:
         """
-        格式化单个订阅的统计信息。
+        格式化单个订阅的统计信息（简洁版，隐藏零值字段）。
         """
         if item.get("message"):
-            return f"- {item.get('title')}：{item.get('status')}，{item.get('message')}"
-        return (
-            f"- {item.get('title')}：{item.get('status')}，"
-            f"资源 {item.get('resources', 0)}，站点 {item.get('sites', 0)}，"
-            f"新增记录 {item.get('note_delta', 0)}，缺失减少 {item.get('lack_delta', 0)}，"
-            f"剩余缺失 {item.get('lack_after') if item.get('lack_after') is not None else '-'}"
-        )
+            return f"{item.get('title')}: {item.get('message')}"
+
+        title = item.get('title', '')
+        status = item.get('status', '')
+        resources = item.get('resources', 0)
+        sites = item.get('sites', 0)
+        note_delta = item.get('note_delta', 0)
+        lack_delta = item.get('lack_delta', 0)
+        lack_after = item.get('lack_after')
+
+        if status == "有进展":
+            parts = [f"{title}: ✓"]
+            if note_delta > 0:
+                parts.append(f"新增记录+{note_delta}")
+            if lack_delta > 0:
+                parts.append(f"缺失减少{lack_delta}")
+            if lack_after is not None:
+                parts.append(f"剩余缺失{lack_after}")
+            return " | ".join(parts)
+
+        # 无进展
+        parts = [title]
+        if resources > 0:
+            res = f"资源{resources}"
+            if sites > 0:
+                res += f"({sites}站)"
+            parts.append(res)
+        else:
+            parts.append("无资源")
+        if lack_after is not None:
+            parts.append(f"缺失{lack_after}集" if lack_after else "已完成")
+        return " | ".join(parts)
 
     def _get_stale_reference_time(self, subscribe: Any) -> Optional[datetime.datetime]:
         """
@@ -710,4 +1242,9 @@ class SubscribeStaleSearch(_PluginBase):
             "stat_enabled": self._stat_enabled,
             "stat_search_mode": self._stat_search_mode,
             "max_count": self._max_count,
+            "auto_pending": self._auto_pending,
+            "consecutive_limit": self._consecutive_limit,
+            "pending_check_enabled": self._pending_check_enabled,
+            "pending_check_cron": self._pending_check_cron,
+            "pending_check_notify": self._pending_check_notify,
         })

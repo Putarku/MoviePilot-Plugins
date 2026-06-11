@@ -1,6 +1,5 @@
 import datetime
 import json
-import random
 import re
 from threading import Event
 from typing import Tuple, List, Dict, Any
@@ -13,10 +12,10 @@ from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.metainfo import MetaInfo
+from app.helper.browser import PlaywrightHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import MediaType
-from app.utils.http import RequestUtils
 
 
 class MaoyanRank(_PluginBase):
@@ -40,9 +39,9 @@ class MaoyanRank(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/main/icons/maoyan.jpg"
     # 插件版本
-    plugin_version = "2.9"
+    plugin_version = "3.0"
     # 插件作者
-    plugin_author = "逗猫"
+    plugin_author = "逗猫,布丁"
     # 作者主页
     author_url = "https://github.com/baozaodetudou"
     # 插件配置项ID前缀
@@ -917,80 +916,72 @@ class MaoyanRank(_PluginBase):
 
     def __get_url_info(self, movie_url, tv_urls, web_movie_url, num=10):
         """
-        根据url获取
+        根据url获取（使用 CloakBrowser 获取 JSON 数据）
         """
         movies_list = []
         tv_list = []
-        user_agent = self.get_random_user_agent()
-        headers = {
-            'User-Agent': user_agent,
-        }
+
+        def _fetch_json(url, timeout=30):
+            """使用 CloakBrowser 获取 JSON 接口数据"""
+            return PlaywrightHelper().action(
+                url=url,
+                callback=lambda p: p.inner_text("body"),
+                timeout=timeout
+            )
+
         if movie_url:
             try:
-                # 打开网页
-                response = RequestUtils().get_res(movie_url, headers=headers)
-                # 获取页面内容
-                res = response.json()
-                data = res.get('movieList', {}).get('list', [])
-                def info(movie):
-                    infos = movie.get('movieInfo')
-                    return {
-                        "title": infos.get('movieName'),
-                        "releaseInfo": infos.get('releaseInfo'),
-                    }
-
-                movies_list += [info(i) for i in data][:num]
+                source = _fetch_json(movie_url)
+                if source:
+                    res = json.loads(source)
+                    data = res.get('movieList', {}).get('list', [])
+                    for i in data[:num]:
+                        infos = i.get('movieInfo', {})
+                        movies_list.append({
+                            "title": infos.get('movieName'),
+                            "releaseInfo": infos.get('releaseInfo'),
+                        })
             except Exception as e:
-                logger.error(f"获取网页源码失败: {str(e)}")
+                logger.error(f"获取电影榜单数据失败: {str(e)}")
+
         if web_movie_url:
             try:
-                # 打开网页
-                response = RequestUtils().get_res(web_movie_url, headers=headers)
-                # 获取页面内容
-                res = response.json()
-                data = res.get('data', {}).get('list', [])
-                def info(movie):
-                    return {
-                        "title": movie.get('name'),
-                        "platformDesc": movie.get('platformDesc'),
-                    }
-
-                movies_list += [info(i) for i in data][:num]
+                source = _fetch_json(web_movie_url)
+                if source:
+                    res = json.loads(source)
+                    data = res.get('data', {}).get('list', [])
+                    for i in data[:num]:
+                        movies_list.append({
+                            "title": i.get('name'),
+                            "platformDesc": i.get('platformDesc'),
+                        })
             except Exception as e:
-                logger.error(f"获取网页源码失败: {str(e)}")
-        if tv_urls:
-            for tv in tv_urls:
-                try:
-                    tv_url = tv[0]
-                    tv_num = tv[1]
-                    # 打开网页
-                    response = RequestUtils().get_res(tv_url, headers=headers)
-                    # 获取页面内容
-                    res = response.json()
-                    data = res.get('dataList', {}).get('list', [])
+                logger.error(f"获取网络电影榜单数据失败: {str(e)}")
 
-                    def tv_info(tv):
-                        infos = tv.get('seriesInfo')
-                        return {
-                            "title": infos.get('name'),
-                            "releaseInfo": infos.get('releaseInfo'),
-                            "platformDesc": infos.get('platformDesc'),
-                        }
-                    tv_list.extend([tv_info(i) for i in data][:tv_num])
+        if tv_urls:
+            for tv_url, tv_num in tv_urls:
+                try:
+                    source = _fetch_json(tv_url)
+                    if source:
+                        res = json.loads(source)
+                        data = res.get('dataList', {}).get('list', [])
+                        for i in data[:tv_num]:
+                            infos = i.get('seriesInfo', {})
+                            tv_list.append({
+                                "title": infos.get('name'),
+                                "releaseInfo": infos.get('releaseInfo'),
+                                "platformDesc": infos.get('platformDesc'),
+                            })
                 except Exception as e:
-                    logger.error(f"获取网页源码失败: {str(e)}")
-            # 使用字典推导式和集合保持唯一性
-            unique_dicts = {item['title']: item for item in tv_list}.values()
-            # 转回列表形式
-            tv_list = list(unique_dicts)
+                    logger.error(f"获取剧集榜单数据失败: {str(e)}")
+
+            # 去重（保留顺序）
+            seen = set()
+            tv_list_unique = []
+            for item in tv_list:
+                if item['title'] not in seen:
+                    seen.add(item['title'])
+                    tv_list_unique.append(item)
+            tv_list = tv_list_unique
 
         return movies_list, tv_list
-
-    @staticmethod
-    def get_random_user_agent():
-        user_agents = [
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        ]
-        return random.choice(user_agents)

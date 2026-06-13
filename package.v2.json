@@ -1,11 +1,11 @@
 {
   "MaoyanRank": {
-    "name": "猫眼榜单订阅",
+    "name": "猫眼榜单订阅(更新版)",
     "description": "监控猫眼数据，自动添加订阅。",
     "version": "3.0",
     "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/main/icons/maoyan.jpg",
     "color": "#fefefe",
-    "author": "逗猫",
+    "author": "逗猫,布丁",
     "level": 1,
     "history": {
       "v3.0": "适配 CloakBrowser；替换 RequestUtils 为 PlaywrightHelper",

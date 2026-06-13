@@ -33,7 +33,7 @@ class MaoyanRank(_PluginBase):
 
     """
     # 插件名称
-    plugin_name = "猫眼榜单订阅"
+    plugin_name = "猫眼榜单订阅(更新版)"
     # 插件描述
     plugin_desc = "监控猫眼数据，自动添加订阅。"
     # 插件图标

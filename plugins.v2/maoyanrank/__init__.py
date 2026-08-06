@@ -45,7 +45,7 @@ class MaoyanRank(_PluginBase):
     # 作者主页
     author_url = "https://github.com/baozaodetudou"
     # 插件配置项ID前缀
-    plugin_config_prefix = "maoyanrank_"
+    plugin_config_prefix = "maoyanrank_putarku"
     # 加载顺序
     plugin_order = 6
     # 可使用的用户级别
